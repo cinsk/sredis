@@ -1,0 +1,5 @@
+/libsredis.a
+/libsredis.so
+*~
+#*
+/root/
