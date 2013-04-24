@@ -3,10 +3,27 @@
 sredis
 ======
 
-Simple Redis Client (helpers to hiredis)
+Simple Redis Client (wrapper to hiredis) in C
+
+
+Introduction
+------------
+
+Sredis is convenient wrapper to [hiredis](http://redis.io/), the official redis client.  What Sredis provides are:
+
+- Disconnection recovery
+- Connect to the master node automatically
+- Easier redis transaction / pipeline interface
+
+What Sredis lacks are:
+
+- Asynchronous API
+
 
 Compilation
 -----------
+
+Note that this project contains [hiredis](http://redis.io/) as a GIT submodule.  Installing Sredis will also install hiredis.
 
     $ git clone https://github.com/cinsk/sredis.git
     $ cd sredis
