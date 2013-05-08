@@ -2,8 +2,12 @@
 #define SREDIS_H__
 
 #include <sys/time.h>
+#ifdef _PTHREAD
+#include <pthread.h>
+#endif
 
 #include "hiredis.h"
+#include "xerror.h"
 
 /* This indirect using of extern "C" { ... } makes Emacs happy */
 #ifndef BEGIN_C_DECLS
@@ -15,6 +19,7 @@
 #  define END_C_DECLS
 # endif
 #endif /* BEGIN_C_DECLS */
+
 
 BEGIN_C_DECLS
 
@@ -42,8 +47,39 @@ struct REDIS_ {
   short ver_major;
   short ver_minor;
   // short ver_tiny;
+
+#ifdef _PTHREAD
+  pthread_mutex_t mutex;
+#endif
 };
 typedef struct REDIS_ REDIS;
+
+#ifdef _PTHREAD
+# define redis_lock(redis)       do {                   \
+  int ret = pthread_mutex_lock(&(redis)->mutex);        \
+  if (ret)                                              \
+    xdebug(ret, "pthread_mutex_lock() failed");         \
+  } while (0)
+# define redis_unlock(redis)     do {                   \
+  int ret = pthread_mutex_unlock(&(redis)->mutex);      \
+  if (ret)                                              \
+    xdebug(ret, "pthread_mutex_unlock() failed");       \
+  } while (0)
+
+static __inline__ int
+redis_trylock(REDIS *redis)
+{
+  int ret = pthread_mutex_trylock(&(redis)->mutex);
+  if (ret && ret != EBUSY)
+    xdebug(ret, "pthread_mutex_trylock() failed");
+  return ret;
+}
+
+#else
+# define redis_lock(redis)       (void)0
+# define redis_unlock(redis)     (void)0
+# define redis_trylock(redis)    (EINVAL)
+#endif  /* _PTHREAD */
 
 /*
  * Create and allocate REDIS structure.
@@ -103,6 +139,7 @@ int redis_host_del(REDIS *redis, int index);
  * disconnected.
  */
 int redis_reopen(REDIS *redis);
+int redis_reopen_unlocked(REDIS *rd);
 
 /*
  * A wrapper to redisCommand().
@@ -115,6 +152,8 @@ int redis_reopen(REDIS *redis);
  */
 redisReply *redis_command(REDIS *redis, const char *format, ...)
   __attribute__ ((format (printf, 2, 3)));
+redisReply *redis_command_unlocked(REDIS *redis, const char *format, ...)
+  __attribute__ ((format (printf, 2, 3)));
 
 /*
  * Similar to redis_command() but this function will just fail if the
@@ -122,6 +161,9 @@ redisReply *redis_command(REDIS *redis, const char *format, ...)
  */
 redisReply *redis_command_fast(REDIS *redis, const char *format, ...)
   __attribute__ ((format (printf, 2, 3)));
+redisReply *redis_command_fast_unlocked(REDIS *redis, const char *format, ...)
+  __attribute__ ((format (printf, 2, 3)));
+
 
 /*
  * A wrapper to redisAppendCommand().
@@ -130,6 +172,8 @@ redisReply *redis_command_fast(REDIS *redis, const char *format, ...)
  * transation)
  */
 int redis_append(REDIS *redis, const char *format, ...)
+  __attribute__ ((format (printf, 2, 3)));
+int redis_append_unlocked(REDIS *redis, const char *format, ...)
   __attribute__ ((format (printf, 2, 3)));
 
 /*
@@ -142,6 +186,7 @@ int redis_append(REDIS *redis, const char *format, ...)
  * contains each result of the redis_append() calls.
  */
 redisReply *redis_exec(REDIS *redis);
+redisReply *redis_exec_unlocked(REDIS *redis);
 
 /*
  * Release redisReply struct.

@@ -7,7 +7,6 @@
 #include <errno.h>
 
 #include "sredis.h"
-#include "xerror.h"
 
 
 #ifndef FALSE
@@ -429,7 +428,7 @@ redis_parse_version(REDIS *rd)
 
 
 int
-redis_reopen(REDIS *rd)
+redis_reopen_unlocked(REDIS *rd)
 {
   /* For maintainers:
    *   remember that whenever REDIS->CTX is changed, you need to reset
@@ -483,6 +482,19 @@ redis_reopen(REDIS *rd)
 }
 
 
+int
+redis_reopen(REDIS *rd)
+{
+  int ret;
+
+  redis_lock(rd);
+  ret = redis_reopen_unlocked(rd);
+  redis_unlock(rd);
+
+  return ret;
+}
+
+
 #if 0
 int
 redis_reopen(REDIS *rd)
@@ -530,7 +542,13 @@ redis_close(REDIS *rd)
   if (rd == 0)
     return;
 
+  redis_lock(rd);
   redis_shutdown(rd);
+  redis_unlock(rd);
+
+#ifdef _PTHREAD
+  pthread_mutex_destroy(&rd->mutex);
+#endif
 
   free(rd);
 }
@@ -544,6 +562,8 @@ redis_host_add(REDIS *redis, const char *host, int port,
   int i;
   struct redis_hostent *p;
 
+  redis_lock(redis);
+
   for (i = 0; i < REDIS_HOSTS_MAX; i++) {
     if (redis->hosts[i] == NULL) {
       p = malloc(sizeof(*p));
@@ -553,6 +573,7 @@ redis_host_add(REDIS *redis, const char *host, int port,
       p->host = strdup(host);
       if (!p->host) {
         free(p);
+        redis_unlock(redis);
         return -1;
       }
       p->port = port;
@@ -571,6 +592,7 @@ redis_host_add(REDIS *redis, const char *host, int port,
         p->o_timeout.tv_usec = 0;
       }
       redis->hosts[i] = p;
+      redis_unlock(redis);
       return i;
     }
   }
@@ -592,6 +614,7 @@ redis_host_add(REDIS *redis, const char *host, int port,
 #endif  /* 0 */
 
   errno = ENOSPC;
+  redis_unlock(redis);
   return -1;
 }
 
@@ -603,8 +626,10 @@ redis_shutdown(REDIS *redis)
 
   assert(redis->stacked == 0);
 
-  if (redis->ctx)
+  if (redis->ctx) {
     redisFree(redis->ctx);
+    redis->ctx = NULL;
+  }
 
   for (i = 0; i < REDIS_HOSTS_MAX; i++)
     redis_host_del(redis, i);
@@ -619,13 +644,16 @@ redis_host_del(REDIS *redis, int index)
   assert(index >= 0);
   assert(index < REDIS_HOSTS_MAX);
 
+  redis_lock(redis);
   if (redis->hosts[index]) {
     if (redis->hosts[index]->host)
       free((void *)redis->hosts[index]->host);
     free(redis->hosts[index]);
     redis->hosts[index] = NULL;
+    redis_unlock(redis);
     return 0;
   }
+  redis_unlock(redis);
   return -1;
 }
 
@@ -650,6 +678,31 @@ redis_new(void)
   p->ver_major = 0;
   p->ver_minor = 0;
 
+#ifdef _PTHREAD
+  {
+    int err;
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    err = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (err) {
+      xdebug(err, "pthread_mutexattr_settype() failed");
+      pthread_mutexattr_destroy(&attr);
+      free(p);
+      return NULL;
+    }
+
+    err = pthread_mutex_init(&p->mutex, &attr);
+    if (err) {
+      xdebug(err, "pthread_mutex_init() failed");
+      pthread_mutexattr_destroy(&attr);
+      free(p);
+      return NULL;
+    }
+
+    pthread_mutexattr_destroy(&attr);
+  }
+#endif  /* _PTHREAD */
+
   return p;
 }
 
@@ -660,6 +713,9 @@ redis_open(const char *host, int port, const struct timeval *c_timeout,
 {
   REDIS *p = redis_new();
 
+  if (!p)
+    return NULL;
+
   if (redis_host_add(p, host, port, c_timeout, o_timeout) != 0) {
     redis_close(p);
     return NULL;
@@ -669,7 +725,7 @@ redis_open(const char *host, int port, const struct timeval *c_timeout,
   /* If the redis server is not available yet, redis_reopen() will fail,
    * but we can continue if later the server is available, since redis_reopen()
    * will be called if redis->ctx is NULL. */
-  if (redis_reopen(p) != 0) {
+  if (redis_reopen_unlocked(p) != 0) {
     redis_close(p);
     return NULL;
   }
@@ -680,14 +736,15 @@ redis_open(const char *host, int port, const struct timeval *c_timeout,
 
 
 static redisReply *
-redis_vcommand(REDIS *redis, int reopen, const char *format, va_list ap)
+redis_vcommand_unlocked(REDIS *redis, int reopen,
+                        const char *format, va_list ap)
 {
   redisReply *reply = NULL;
 
   assert(redis->stacked == 0);
 
   if (!redis->ctx) {
-    if (reopen && redis_reopen(redis) != 0) {
+    if (reopen && redis_reopen_unlocked(redis) != 0) {
       xdebug(0, "redis re-connection failed");
       return NULL;
     }
@@ -703,7 +760,7 @@ redis_vcommand(REDIS *redis, int reopen, const char *format, va_list ap)
 
   if (!reply) {
     xdebug(0, "redis null reply");
-    if (reopen && redis_reopen(redis) != 0)
+    if (reopen && redis_reopen_unlocked(redis) != 0)
       xdebug(0, "redis re-connection failed");
     else
       xdebug(0, "redis re-connected");
@@ -711,6 +768,32 @@ redis_vcommand(REDIS *redis, int reopen, const char *format, va_list ap)
   else if (reply->type == REDIS_REPLY_ERROR) {
     xdebug(0, "redis error: %s", reply->str);
   }
+
+  return reply;
+}
+
+
+static redisReply *
+redis_vcommand(REDIS *redis, int reopen,
+               const char *format, va_list ap)
+{
+  redisReply *reply;
+  redis_lock(redis);
+  reply = redis_vcommand_unlocked(redis, reopen, format, ap);
+  redis_unlock(redis);
+  return reply;
+}
+
+
+redisReply *
+redis_command_fast_unlocked(REDIS *redis, const char *format, ...)
+{
+  va_list ap;
+  redisReply *reply = NULL;
+
+  va_start(ap, format);
+  reply = redis_vcommand_unlocked(redis, FALSE, format, ap);
+  va_end(ap);
 
   return reply;
 }
@@ -731,6 +814,20 @@ redis_command_fast(REDIS *redis, const char *format, ...)
 
 
 redisReply *
+redis_command_unlocked(REDIS *redis, const char *format, ...)
+{
+  va_list ap;
+  redisReply *reply = NULL;
+
+  va_start(ap, format);
+  reply = redis_vcommand_unlocked(redis, TRUE, format, ap);
+  va_end(ap);
+
+  return reply;
+}
+
+
+redisReply *
 redis_command(REDIS *redis, const char *format, ...)
 {
   va_list ap;
@@ -744,10 +841,9 @@ redis_command(REDIS *redis, const char *format, ...)
 }
 
 
-int
-redis_append(REDIS *redis, const char *format, ...)
+static int
+redis_vappend(REDIS *redis, const char *format, va_list ap)
 {
-  va_list ap;
   int ret;
 
   if (!redis->ctx) {
@@ -756,7 +852,7 @@ redis_append(REDIS *redis, const char *format, ...)
       redis->stacked = 0;
     }
     /* we cannot call redis_reopen iff (redis->stacked != 0) */
-    if (redis_reopen(redis) != 0) {
+    if (redis_reopen_unlocked(redis) != 0) {
       xdebug(0, "redis re-connection failed");
       return REDIS_ERR;
     }
@@ -764,12 +860,40 @@ redis_append(REDIS *redis, const char *format, ...)
       xdebug(0, "redis re-connected");
   }
 
-  va_start(ap, format);
   ret = redisvAppendCommand(redis->ctx, format, ap);
-  va_end(ap);
 
   if (ret == REDIS_OK)
     redis->stacked++;
+
+  return ret;
+}
+
+
+int
+redis_append_unlocked(REDIS *redis, const char *format, ...)
+{
+  va_list ap;
+  int ret;
+
+  va_start(ap, format);
+  ret = redis_vappend(redis, format, ap);
+  va_end(ap);
+
+  return ret;
+}
+
+
+int
+redis_append(REDIS *redis, const char *format, ...)
+{
+  va_list ap;
+  int ret;
+
+  va_start(ap, format);
+  redis_lock(redis);
+  ret = redis_vappend(redis, format, ap);
+  redis_unlock(redis);
+  va_end(ap);
 
   return ret;
 }
@@ -790,7 +914,7 @@ createReplyObject(int type)
 
 
 redisReply *
-redis_exec(REDIS *redis)
+redis_exec_unlocked(REDIS *redis)
 {
   redisReply *reply, *packed;
   size_t i;
@@ -841,9 +965,20 @@ redis_exec(REDIS *redis)
   freeReplyObject(packed);
 
   redis->stacked = 0;
-  redis_reopen(redis);
+  redis_reopen_unlocked(redis);
 
   return NULL;
+}
+
+
+redisReply *
+redis_exec(REDIS *redis)
+{
+  redisReply *reply;
+  redis_lock(redis);
+  reply = redis_exec_unlocked(redis);
+  redis_unlock(redis);
+  return reply;
 }
 
 

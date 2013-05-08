@@ -31,7 +31,7 @@ STLIB_MAKE_CMD=ar rcs $(STLIBNAME)
 
 .PHONY: hiredis hiredis-clean hiredis-install all clean install
 
-all: hiredis $(DYLIBNAME) $(STLIBNAME) sredis-example
+all: hiredis $(DYLIBNAME) $(STLIBNAME) sredis-example sredis-benchmark
 
 $(OBJS): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -50,8 +50,13 @@ sredis-example: sredis-example.o $(DYLIBNAME)
 		-Wl,-rpath=$(INSTALL_LIBRARY_PATH) \
 		-L. -lsredis $(LDFLAGS)
 
-sredis-example.o: sredis-example.c
-	$(CC) $(CFLAGS) -c sredis-example.c
+sredis-benchmark: sredis-benchmark.o $(DYLIBNAME)
+	$(CC) -o sredis-benchmark sredis-benchmark.o $(OBJS) \
+		-Wl,-rpath=$(INSTALL_LIBRARY_PATH) \
+		-L. -lsredis $(LDFLAGS) -lrt
+
+sredis-example.o sredis-benchmark.o: %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 hiredis:
 	$(MAKE) -C hiredis
