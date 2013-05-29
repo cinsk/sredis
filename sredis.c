@@ -7,6 +7,7 @@
 #include <errno.h>
 
 #include "sredis.h"
+#include "xerror.h"
 
 
 #ifndef FALSE
@@ -158,7 +159,7 @@ redis_find_master_26(REDIS *redis)
   }
 
   if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) {
-    xdebug(0, "unexpected redis response type(%d), elms(%d)",
+    xdebug(0, "unexpected redis response type(%d), elms(%zd)",
            reply->type, reply->elements);
     goto fin;
   }
@@ -990,6 +991,33 @@ redis_free(redisReply *reply)
 }
 
 
+static struct {
+  int type;
+  char *name;
+} reply_types[] = {
+#define P(x)    { x, #x }
+  P(REDIS_REPLY_STRING),
+  P(REDIS_REPLY_ARRAY),
+  P(REDIS_REPLY_INTEGER),
+  P(REDIS_REPLY_NIL),
+  P(REDIS_REPLY_STATUS),
+  P(REDIS_REPLY_ERROR),
+  { 0, 0 },
+#undef P
+};
+
+
+static const char *
+reply_type_string(int type)
+{
+  int i;
+  for (i = 0; reply_types[i].type != 0; i++)
+    if (reply_types[i].type == type)
+      return reply_types[i].name;
+  return "*UNKNOWN*";
+}
+
+
 void
 redis_dump_reply(const redisReply *reply,
                  const char *prefix, int indent)
@@ -1002,12 +1030,13 @@ redis_dump_reply(const redisReply *reply,
   if (!reply)
     xerror(0, 0, "%*s%s reply: null", idnt, " ", prefix);
   else {
-    xerror(0, 0, "%*s%s reply: type(%d)", idnt, " ", prefix, reply->type);
+    xerror(0, 0, "%*s%s reply: type(%d:%s)", idnt, " ", prefix,
+           reply->type, reply_type_string(reply->type));
 
     switch (reply->type) {
     case REDIS_REPLY_STRING:
     case REDIS_REPLY_ERROR:
-      xerror(0, 0, "%*s%s reply: NULL", idnt, " ", prefix);
+      xerror(0, 0, "%*s%s reply: %s", idnt, " ", prefix, reply->str);
       break;
     case REDIS_REPLY_INTEGER:
       xerror(0, 0, "%*s%s reply: %lld", idnt, " ", prefix, reply->integer);

@@ -6,7 +6,7 @@
 #include <pthread.h>
 #endif
 
-#include "hiredis.h"
+#include "hiredis/hiredis.h"
 #include "xerror.h"
 
 /* This indirect using of extern "C" { ... } makes Emacs happy */
