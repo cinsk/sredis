@@ -2,11 +2,12 @@
 #define SREDIS_H__
 
 #include <sys/time.h>
+#include <errno.h>
 #ifdef _PTHREAD
 #include <pthread.h>
 #endif
 
-#include "hiredis.h"
+#include "hiredis/hiredis.h"
 #include "xerror.h"
 
 /* This indirect using of extern "C" { ... } makes Emacs happy */
@@ -39,6 +40,16 @@ struct redis_hostent {
 struct REDIS_ {
   redisContext *ctx;
 
+  /* 'hosts' and 'chost' work like file descriptor table.  Newly added
+   * host normally get higher index value in 'hosts'.  However, if
+   * there is an empty slot in 'hosts', then it will be used for the
+   * new host entry.  Removed hosts entry will be marked as an empty
+   * slot.
+   *
+   * If the current host is unusable, redis_next_host() will increase
+   * 'chost' by one, then try to use the next one.  If 'chost' reaches
+   * to REDIS_HOSTS_MAX, then it will start from zero, again.
+   */
   struct redis_hostent *hosts[REDIS_HOSTS_MAX];
   int chost;                    /* index to the current host in HOSTS  */
 

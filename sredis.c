@@ -14,6 +14,8 @@
 #define TRUE    (!FALSE)
 #endif
 
+#define ERR_READONLY    "READONLY"
+
 #define ENDPOINT_DELIMS " \t\v\n\r"
 #define REDIS_INFO_DELIMS       "\r\n"
 #define REDIS_INFOENT_DELIMS       ":"
@@ -53,6 +55,7 @@ typedef int (*redis_info_handler)(REDIS *redis,
 
 static int redis_parse_version(REDIS *rd);
 
+static struct redis_hostent *redis_get_host(REDIS *rd, int index);
 static struct redis_hostent *redis_next_host(REDIS *rd);
 static redisReply *redis_vcommand(REDIS *redis, int reopen,
                                   const char *format, va_list ap);
@@ -63,9 +66,9 @@ static struct redis_hostent *redis_get_hostent_create(REDIS *redis,
 static int redis_parse_info(REDIS *rd, redis_info_handler handler, void *data);
 
 //static int redis_get_info(REDIS *rd);
-static struct redis_hostent *redis_find_master(REDIS *redis);
-static struct redis_hostent *redis_find_master_24(REDIS *redis);
-static struct redis_hostent *redis_find_master_26(REDIS *redis);
+static int redis_find_master(REDIS *redis, struct redis_hostent **ent);
+static int redis_find_master_24(REDIS *redis, struct redis_hostent **ent);
+static int redis_find_master_26(REDIS *redis, struct redis_hostent **ent);
 
 
 static inline int
@@ -113,42 +116,68 @@ redis_parse_master_handler(REDIS *rd,
   return 1;
 }
 
-
-static struct redis_hostent *
-redis_find_master(REDIS *redis)
+/*
+ * redis_find_master*(), all these functions returns -1 on failure,
+ * and returns zero on success.  Success means that it found the
+ * master.
+ *
+ * If the current connected one is the master, *ENT will be set to
+ * zero.  Otherwise, *ENT will be set to the new master endpoint.
+ */
+static int
+redis_find_master(REDIS *redis, struct redis_hostent **ent)
 {
   assert(REDIS_IS_HIGHER(redis, 2, 4) >= 0);
 
   if (REDIS_IS_HIGHER(redis, 2, 6) >= 0)
-    return redis_find_master_26(redis);
+    return redis_find_master_26(redis, ent);
   else
-    return redis_find_master_24(redis);
+    return redis_find_master_24(redis, ent);
 }
 
 
-static struct redis_hostent *
-redis_find_master_24(REDIS *redis)
+static int
+redis_find_master_24(REDIS *redis, struct redis_hostent **ent)
 {
   struct repldata data = { 0, NULL, 0 };
   struct redis_hostent *ret = NULL;
   int s;
 
+  /* redis_parse_info() will allocate data->host to point the master
+   * host if it returns zero, so you need to free() it later. */
   s = redis_parse_info(redis, redis_parse_master_handler, &data);
   if (s < 0)
-    return NULL;
+    return -1;                  /* couldn't find the master */
 
-  ret = redis_get_hostent_create(redis, data.host, data.port);
-  free(data.host);
-  return ret;
+  if (data.master) {
+    free(data.host);
+    *ent = 0;
+    return 0;                   /* found, this is the master */
+  }
+  else {                        /* found. */
+    ret = redis_get_hostent_create(redis, data.host, data.port);
+
+    free(data.host);
+
+    if (ret) {                  /* found, registered */
+      *ent = ret;
+      return 0;
+    }
+    else {                      /* found, but couldn't register */
+      *ent = 0;
+      return -1;
+    }
+  }
 }
 
 
-static struct redis_hostent *
-redis_find_master_26(REDIS *redis)
+static int
+redis_find_master_26(REDIS *redis, struct redis_hostent **ent)
 {
   char *endpoint;
   char *tok, *saveptr, *addr;
   int port;
+  int retval = -1;
   struct redis_hostent *ret = NULL;
   redisReply *reply = redis_command_fast(redis, "CONFIG GET slaveof");
 
@@ -158,7 +187,7 @@ redis_find_master_26(REDIS *redis)
   }
 
   if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) {
-    xdebug(0, "unexpected redis response type(%d), elms(%d)",
+    xdebug(0, "unexpected redis response type(%d), elms(%zd)",
            reply->type, reply->elements);
     goto fin;
   }
@@ -172,6 +201,7 @@ redis_find_master_26(REDIS *redis)
   tok = strtok_r(endpoint, ENDPOINT_DELIMS, &saveptr);
   if (!tok) {                   /* this is the master, nothing to do */
     ret = NULL;
+    retval = 0;
   }
   else {
     addr = tok;
@@ -183,14 +213,20 @@ redis_find_master_26(REDIS *redis)
     port = atoi(tok);
 
     ret = redis_get_hostent_create(redis, addr, port);
+    if (ret)
+      retval = 0;
   }
 
  fin:
+  *ent = ret;
   redis_free(reply);
-  return ret;
+  return retval;
 }
 
-
+/*
+ * Add the new endpoint to the REDIS::hosts, and return the address of
+ * the entry.  If adding failed (e.g. out of slot), it returns NULL.
+ */
 static struct redis_hostent *
 redis_get_hostent_create(REDIS *redis, const char *host, int port)
 {
@@ -198,6 +234,8 @@ redis_get_hostent_create(REDIS *redis, const char *host, int port)
   struct redis_hostent *p;
 
   for (i = 0; i < REDIS_HOSTS_MAX; i++) {
+    /* In this for loop, we try to determine whether the master
+     * endpoint is already registered in redis->hosts[]. */
     p = redis->hosts[i];
     if (p == NULL)
       continue;
@@ -207,11 +245,21 @@ redis_get_hostent_create(REDIS *redis, const char *host, int port)
   }
 
   p = redis->hosts[redis->chost];
-  assert(p != NULL);
+  assert(p != NULL);            /* TODO: is this necessary? */
 
   i = redis_host_add(redis, host, port, &p->c_timeout, &p->o_timeout);
   if (i < 0)
-    return NULL;
+    return NULL;                /* error: no more space in redis->hosts[] */
+
+  /* TODO: Is this right approach? I mean, to add new master endpoint in
+   *       redis->hosts[]. */
+
+  /* TODO: I don't know whether it is right to update redis->chost to the
+   *       new master index.   If we have endpoints at index 0, 1, and 2.
+   *       and suppose redis->chost is 0.  If we add new master, it will
+   *       have index to 3.  So if this failed, we'll start to find new
+   *       one at index zero.  This mean, the endpoint at index 1 and 2
+   *       is not tried at first iteration. */
   redis->chost = i;
 
   return redis->hosts[i];
@@ -219,10 +267,20 @@ redis_get_hostent_create(REDIS *redis, const char *host, int port)
 
 
 static struct redis_hostent *
+redis_get_host(REDIS *rd, int index)
+{
+  assert(index >= 0 && index < REDIS_HOSTS_MAX);
+  return (rd->hosts[index]);
+}
+
+static struct redis_hostent *
 redis_next_host(REDIS *rd)
 {
   int i, j;
   int pos;
+
+  /* For maintainers:  please update the comments in struct REDIS_ in
+   * <sredis.h> whenever you update this function. */
 
   assert(rd != NULL);
 
@@ -435,48 +493,78 @@ redis_reopen_unlocked(REDIS *rd)
    *   members in REDIS (e.g. ver_major and ver_minor) according to the
    *   new REDIS->CTX. */
   struct redis_hostent *ent;
+  int i;
 
-  MARK_FAILED(rd);
-
-  if (rd->ctx) {
-    redisFree(rd->ctx);
-    rd->ctx = NULL;
-  }
-
-  ent = redis_next_host(rd);
-
-  rd->ver_major = rd->ver_minor = 0;
-
-  rd->ctx = redis_context(ent);
-  if (!rd->ctx)
+#if 0
+  if (rd->chost <= 0) {
     return -1;
-  else {
-    if (redis_parse_version(rd) == -1) {
+  }
+#endif  /* 0 */
+
+  for (i = 0; i < REDIS_HOSTS_MAX; i++) {
+    rd->chost = (rd->chost + 1) % REDIS_HOSTS_MAX;
+    ent = redis_get_host(rd, rd->chost);
+    if (!ent)
+      continue;
+
+    MARK_FAILED(rd);
+
+    if (rd->ctx) {
       redisFree(rd->ctx);
       rd->ctx = NULL;
-      return -1;
     }
 
-    MARK_SUCCESS(rd);
-  }
-
-  ent = redis_find_master(rd);
-
-  if (ent != NULL) {            /* ENT is the new master */
     rd->ver_major = rd->ver_minor = 0;
-    redisFree(rd->ctx);
-    rd->ctx = redis_context(ent);
-    /* Note that if redis is mis-configured for the master, above call
-     * may fail */
 
+    rd->ctx = redis_context(ent);
     if (!rd->ctx) {
-      xerror(0, 0, "can't connect to the master (%s:%d)", ent->host, ent->port);
-      return -1;
+      xdebug(0, "can't connect to the redis server");
+      continue;
     }
     else {
-      redis_parse_version(rd);
+      if (redis_parse_version(rd) == -1) {
+        redisFree(rd->ctx);
+        rd->ctx = NULL;
+        xdebug(0, "can't parse the redis version");
+        continue;
+      }
+      MARK_SUCCESS(rd);
     }
 
+    if (redis_find_master(rd, &ent) == -1) {
+      xerror(0, 0, "can't find the master! need to patch sredis.c");
+      continue;
+    }
+
+    if (ent != NULL) {            /* ENT could be the new master */
+      rd->ver_major = rd->ver_minor = 0;
+      redisFree(rd->ctx);
+      rd->ctx = redis_context(ent);
+      /* Note that if redis is mis-configured for the master, so that
+       * if we can't connect to it, above call may fail */
+
+      if (!rd->ctx) {
+        xerror(0, 0, "can't connect to the master (%s:%d)",
+               ent->host, ent->port);
+      }
+      else {
+        if (redis_parse_version(rd) == -1) {
+          redisFree(rd->ctx);
+          rd->ctx = NULL;
+          xdebug(0, "can't parse the redis version");
+        }
+        else {
+          break;                /* we found the master! */
+        }
+      }
+    }
+    else
+      break;                    /* this is the master! */
+  }
+
+  if (!rd->ctx) {
+    xdebug(0, "tried all registered redis endpoints, none works.");
+    return -1;
   }
   return 0;
 }
@@ -562,6 +650,8 @@ redis_host_add(REDIS *redis, const char *host, int port,
   int i;
   struct redis_hostent *p;
 
+  /* For maintainers:  please update the comments in struct REDIS_ in
+   * <sredis.h> whenever you update this function. */
   redis_lock(redis);
 
   for (i = 0; i < REDIS_HOSTS_MAX; i++) {
@@ -743,6 +833,13 @@ redis_vcommand_unlocked(REDIS *redis, int reopen,
 
   assert(redis->stacked == 0);
 
+#if 0
+  if (redis->chost < 0) {
+    xdebug(0, "redis was not configured, no server endpoint");
+    return NULL;
+  }
+#endif  /* 0 */
+
   if (!redis->ctx) {
     if (reopen && redis_reopen_unlocked(redis) != 0) {
       xdebug(0, "redis re-connection failed");
@@ -767,6 +864,18 @@ redis_vcommand_unlocked(REDIS *redis, int reopen,
   }
   else if (reply->type == REDIS_REPLY_ERROR) {
     xdebug(0, "redis error: %s", reply->str);
+    if (reply->str != 0 && strncasecmp(ERR_READONLY,
+                                       reply->str,
+                                       sizeof(ERR_READONLY) - 1) == 0) {
+      /* Strange, currently connected to the master, but it is
+       * actually a slave.   It seems that hiredis didn't give
+       * a detailed error but a error string. */
+      xdebug(0, "volunterily disconnect from the possible slave");
+      if (redis_reopen_unlocked(redis) != 0)
+        xdebug(0, "redis re-connection failed");
+      else
+        xdebug(0, "redis re-connected");
+    }
   }
 
   return reply;
@@ -990,6 +1099,33 @@ redis_free(redisReply *reply)
 }
 
 
+static struct {
+  int type;
+  char *name;
+} reply_types[] = {
+#define P(x)    { x, #x }
+  P(REDIS_REPLY_STRING),
+  P(REDIS_REPLY_ARRAY),
+  P(REDIS_REPLY_INTEGER),
+  P(REDIS_REPLY_NIL),
+  P(REDIS_REPLY_STATUS),
+  P(REDIS_REPLY_ERROR),
+  { 0, 0 },
+#undef P
+};
+
+
+static const char *
+reply_type_string(int type)
+{
+  int i;
+  for (i = 0; reply_types[i].type != 0; i++)
+    if (reply_types[i].type == type)
+      return reply_types[i].name;
+  return "*UNKNOWN*";
+}
+
+
 void
 redis_dump_reply(const redisReply *reply,
                  const char *prefix, int indent)
@@ -1002,12 +1138,13 @@ redis_dump_reply(const redisReply *reply,
   if (!reply)
     xerror(0, 0, "%*s%s reply: null", idnt, " ", prefix);
   else {
-    xerror(0, 0, "%*s%s reply: type(%d)", idnt, " ", prefix, reply->type);
+    xerror(0, 0, "%*s%s reply: type(%d:%s)", idnt, " ", prefix,
+           reply->type, reply_type_string(reply->type));
 
     switch (reply->type) {
     case REDIS_REPLY_STRING:
     case REDIS_REPLY_ERROR:
-      xerror(0, 0, "%*s%s reply: NULL", idnt, " ", prefix);
+      xerror(0, 0, "%*s%s reply: %s", idnt, " ", prefix, reply->str);
       break;
     case REDIS_REPLY_INTEGER:
       xerror(0, 0, "%*s%s reply: %lld", idnt, " ", prefix, reply->integer);
