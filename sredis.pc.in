@@ -1,0 +1,12 @@
+prefix=@@PREFIX@@
+exec_prefix=${prefix}
+libdir=@@LIBDIR@@
+includedir=@@INCLUDEDIR@@
+
+Name: sredis
+Description: easy interface to hiredis
+Version: @@VERSION@@
+Requires: hiredis
+Libs: -L${libdir} -lsredis
+Cflags: -I${includedir}
+

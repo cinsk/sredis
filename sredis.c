@@ -7,6 +7,7 @@
 #include <errno.h>
 
 #include "sredis.h"
+#include "xerror.h"
 
 
 #ifndef FALSE
