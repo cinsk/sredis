@@ -28,6 +28,47 @@
 
 BEGIN_C_DECLS
 
+extern const char *xbacktrace_executable;
+
+/*
+ * xerror module now support ignore file (".xerrignore").
+ *
+ * If the source filename that calls xdebug() is matched to the
+ * patterns in ".xerrignore", then xdebug() will not print the message
+ * but simply return.
+ *
+ * xerror_init() will search ".xerrignore" file in the current working
+ * directory, and tries to find the file until it reaches the root
+ * directory (like how GDB does for ".gdbinit").
+ *
+ * The contents of .xerrignore is very simple.  Empty lines and lines
+ * with first character '#' are ignored.  Each line may hold one
+ * wildcard pattern.  See fnmatch(3) for more.
+ */
+
+/*
+ * Environment Variables:
+ *
+ * - XBACKTRACE: if not defined, xbacktrace_on_signals() will do nothing.
+ * - XBACKTRACE_NOGDB: if defined, xbacktrace_on_signals will not use GDB(1).
+ * - XBACKTRACE_FILE: This is the filename template for the backtrace info.
+ *                    The actual filename will be $XBACKTRACE_FILE.PID,
+ *                    where PID is the pid of the process.
+ * - XERROR_IGNORES: filename for the ignore patterns.
+ */
+
+/*
+ * Recommended way to initialize xerror module.
+ *
+ * PROGRAM_NAME will override the name of the program if non-zero.
+ * IGNORE_SEARCH_DIR will override the default directory to find ".xerrignore".
+ *
+ */
+extern int xerror_init(const char *program_name, const char *ignore_search_dir);
+
+extern int xthread_set_name(const char *name, ...);
+extern const char *xthread_get_name(char *buf, size_t sz);
+
 /*
  * xerror() is the same as error() in GLIBC.
  */
@@ -52,7 +93,8 @@ extern int xifdebug(void);
 extern void xdebug_(int code, const char *format, ...)
   __attribute__((format (printf, 2, 3)));
 
-extern void xmessage(int progname, int code, const char *format, va_list ap);
+extern void xmessage(int progname, int code, int ignore, int show_tid,
+                     const char *format, va_list ap);
 
 /*
  * By default, all x*() functions will send the output to STDERR.
@@ -63,6 +105,9 @@ extern void xmessage(int progname, int code, const char *format, va_list ap);
  * Note that if you didn't set explicitly the output stream to STDERR,
  * this function will return NULL.  This may be helpful if you want to
  * close the previous output stream except STDERR.
+ *
+ * It is recommended that you call fopen() with "a" open mode for it's
+ * second argument.
  */
 extern FILE *xerror_redirect(FILE *fp);
 
