@@ -7,6 +7,7 @@
 #include <errno.h>
 
 #include "sredis.h"
+#include "xerror.h"
 
 
 #ifndef FALSE
@@ -557,6 +558,9 @@ redis_reopen_unlocked(REDIS *rd)
       }
       MARK_SUCCESS(rd);
     }
+    else
+      break;                    /* this is the master! */
+  }
 
     if (redis_find_master(rd, &ent) == -1) {
       xerror(0, 0, "can't find the master! need to patch sredis.c");
