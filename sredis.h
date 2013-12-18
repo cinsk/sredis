@@ -26,6 +26,7 @@ BEGIN_C_DECLS
 
 
 #define REDIS_HOSTS_MAX         16
+#define REDIS_MULTI_MAX         16
 
 struct redis_hostent {
   const char *host;
@@ -60,6 +61,9 @@ struct REDIS_ {
   // short ver_tiny;
 
   char *password;
+
+  int multi[REDIS_MULTI_MAX];
+  int multi_pos;
 
 #ifdef _PTHREAD
   pthread_mutex_t mutex;
@@ -208,6 +212,50 @@ int redis_append_unlocked(REDIS *redis, const char *format, ...)
  */
 redisReply *redis_exec(REDIS *redis);
 redisReply *redis_exec_unlocked(REDIS *redis);
+
+/*
+ * Start transaction, (a.k.a., redis MULTI command)
+ *
+ * For example:
+ *
+ *   redisReply *reply, *trans_reply;
+ *
+ *   redis_multi(redis);
+ *   redis_append(redis, "...");
+ *   ...
+ *   redis_multi_exec(redis);
+ *   reply = redis_exec(redis);
+ *   trans_reply = redis_multi_reply(redis, reply, 0);
+ *   // access the value in trans_reply
+ *   redis_free(redis);
+ */
+int redis_multi(REDIS *redis);
+
+/*
+ * End transaction, (a.k.a, redis EXEC command)
+ *
+ * Note that to execute the transaction, you still need to call
+ * redis_exec().
+ */
+int redis_multi_exec(REDIS *redis);
+
+/*
+ * Get the INDEX-th transaction result from REPLY.
+ *
+ * It is possible that multiple transaction is enqueued using
+ * redis_multi() ... redis_multi_exec() in one pipelined request.
+ * This function will return the INDEX-th transaction result from
+ * REPLY.
+ *
+ * Note that you need to call redis_free() to REPLY, not to call it to
+ * the return value of this function.
+ *
+ * If the transaction was sucessful, it will return a reply of the
+ * type, REDIS_REPLY_ARRAY.  On transaction failure, it will return a
+ * reply of the type, REDIS_REPLY_NIL.  If REPLY is NULL or INDEX is
+ * out of bound, it will return NULL.
+ */
+redisReply *redis_multi_reply(REDIS *redis, redisReply *reply, int index);
 
 /*
  * Release redisReply struct.

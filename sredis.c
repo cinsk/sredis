@@ -7,7 +7,6 @@
 #include <errno.h>
 
 #include "sredis.h"
-#include "xerror.h"
 
 
 #ifndef FALSE
@@ -60,7 +59,8 @@ static struct redis_hostent *redis_get_host(REDIS *rd, int index);
 static struct redis_hostent *redis_next_host(REDIS *rd);
 static redisReply *redis_vcommand(REDIS *redis, int reopen,
                                   const char *format, va_list ap);
-static redisContext *redis_context(struct redis_hostent *endpoint);
+static redisContext *redis_context(struct redis_hostent *endpoint,
+                                   const char *password);
 static struct redis_hostent *redis_get_hostent_create(REDIS *redis,
                                                       const char *host,
                                                       int port);
@@ -301,7 +301,7 @@ redis_next_host(REDIS *rd)
 
 
 static redisContext *
-redis_context(struct redis_hostent *ent)
+redis_context(struct redis_hostent *ent, const char *password)
 {
   redisContext *ctx;
 
@@ -323,6 +323,22 @@ redis_context(struct redis_hostent *ent)
   else {
     if (ent->o_timeout.tv_sec != 0 || ent->o_timeout.tv_usec != 0)
       redisSetTimeout(ctx, ent->o_timeout);
+
+    if (password) {
+      redisReply *reply = redisCommand(ctx, "AUTH %s", password);
+
+      if (reply == NULL || reply->type != REDIS_REPLY_STATUS) {
+        if (reply->type == REDIS_REPLY_ERROR)
+          xerror(0, 0, "authentication failed: %s", reply->str);
+        else
+          xerror(0, 0, "authentication failed: type(%d)", reply->type);
+        redis_free(reply);
+        redisFree(ctx);
+        ctx = NULL;
+      }
+      else
+        redis_free(reply);
+    }
   }
   return ctx;
 }
@@ -529,27 +545,12 @@ redis_reopen_unlocked(REDIS *rd)
 
     rd->ver_major = rd->ver_minor = 0;
 
-    rd->ctx = redis_context(ent);
+    rd->ctx = redis_context(ent, rd->password);
     if (!rd->ctx) {
       xdebug(0, "can't connect to the redis server");
       continue;
     }
     else {
-      if (rd->password) {
-        redisReply *reply = redis_command_fast(rd, "AUTH %s", rd->password);
-
-        if (redis_iserror(reply) || reply->type != REDIS_REPLY_STATUS) {
-          if (reply->type == REDIS_REPLY_ERROR)
-            xerror(0, 0, "authentication failed: %s", reply->str);
-          else
-            xerror(0, 0, "authentication failed: type(%d)", reply->type);
-          redis_free(reply);
-          continue;
-        }
-        else
-          redis_free(reply);
-      }
-
       if (redis_parse_version(rd) == -1) {
         redisFree(rd->ctx);
         rd->ctx = NULL;
@@ -558,9 +559,6 @@ redis_reopen_unlocked(REDIS *rd)
       }
       MARK_SUCCESS(rd);
     }
-    else
-      break;                    /* this is the master! */
-  }
 
     if (redis_find_master(rd, &ent) == -1) {
       xerror(0, 0, "can't find the master! need to patch sredis.c");
@@ -570,7 +568,7 @@ redis_reopen_unlocked(REDIS *rd)
     if (ent != NULL) {            /* ENT could be the new master */
       rd->ver_major = rd->ver_minor = 0;
       redisFree(rd->ctx);
-      rd->ctx = redis_context(ent);
+      rd->ctx = redis_context(ent, rd->password);
       /* Note that if redis is mis-configured for the master, so that
        * if we can't connect to it, above call may fail */
 
@@ -840,7 +838,11 @@ redis_set_password(REDIS *redis, const char *password)
 {
   if (redis->password)
     free(redis->password);
-  redis->password = strdup(password);
+
+  if (password)
+    redis->password = strdup(password);
+  else
+    redis->password = 0;
 }
 
 
@@ -1026,6 +1028,79 @@ redis_vappend(REDIS *redis, const char *format, va_list ap)
 
 
 int
+redis_multi(REDIS *redis)
+{
+  int ret;
+
+  redis_lock(redis);
+
+#if 0
+  if (redis->multi_pos >= REDIS_MULTI_MAX - 1) {
+    /* redis->multi overflow.  Too many transaction before exec. */
+    redis_unlock(redis);
+    return REDIS_ERR;
+  }
+#endif  /* 0 */
+
+  ret = redis_append_unlocked(redis, "MULTI");
+  if (ret != REDIS_OK) {
+    redis_unlock(redis);
+    return ret;
+  }
+
+  // redis->multi[redis->multi_pos++] = redis->stacked - 1;
+
+  redis_unlock(redis);
+
+  return ret;
+}
+
+
+int
+redis_multi_exec(REDIS *redis)
+{
+  int ret;
+
+  redis_lock(redis);
+
+  if (redis->multi_pos >= REDIS_MULTI_MAX - 1) {
+    /* redis->multi overflow.  Too many transaction before exec. */
+    /* TODO: How to recover from this error? */
+    redis_unlock(redis);
+    return REDIS_ERR;
+  }
+
+  ret = redis_append_unlocked(redis, "EXEC");
+  if (ret != REDIS_OK) {
+    redis_unlock(redis);
+    return ret;
+  }
+
+  redis->multi[redis->multi_pos++] = redis->stacked - 1;
+
+  redis_unlock(redis);
+
+  return ret;
+}
+
+
+redisReply *
+redis_multi_reply(REDIS *redis, redisReply *reply, int index)
+{
+  int mindex;
+
+  if (!reply || reply->type != REDIS_REPLY_ARRAY)
+    return NULL;
+
+  mindex = redis->multi[index];
+  if (mindex >= reply->elements || mindex < 0)
+    return NULL;
+
+  return reply->element[mindex];
+}
+
+
+int
 redis_append_unlocked(REDIS *redis, const char *format, ...)
 {
   va_list ap;
@@ -1110,6 +1185,8 @@ redis_exec_unlocked(REDIS *redis)
     packed->element[i] = reply;
   }
   redis->stacked = 0;
+  redis->multi_pos = 0;
+
   return packed;
 
  err:
@@ -1123,6 +1200,8 @@ redis_exec_unlocked(REDIS *redis)
   freeReplyObject(packed);
 
   redis->stacked = 0;
+  redis->multi_pos = 0;
+
   redis_reopen_unlocked(redis);
 
   return NULL;
