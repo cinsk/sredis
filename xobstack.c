@@ -1,1 +1,0 @@
-../snippets/xobstack/xobstack.c
